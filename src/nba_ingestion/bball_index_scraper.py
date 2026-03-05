@@ -130,11 +130,16 @@ class BballIndexScraper:
             raise RuntimeError("Not authenticated; call authenticate() first")
 
 
+
+
     def authenticate(self) -> None:
-        """Login to bball-index; assigns session on success."""
+        """Login to bball-index; assigns session on success
+
+        Raises RuntimeError if Auth fails (Invalid creds)...
+        """
         session = requests.Session()
         payload = { "log": self.email, "pwd": self.password,
-            "redirect_to": "https://www.bball-index.com/player-profiles/",
+            "redirect_to": self.PROFILE_BASE_URL,
             "testcookie": "1",}
 
         logger.info("Authenticating to bball-index as %s", self.email)
@@ -144,46 +149,47 @@ class BballIndexScraper:
         self.session = session
         logger.info("Authentication successful")
 
-    def _ensure_authenticated(self) -> None:
-        if self.session is None:
-            raise RuntimeError("Not authenticated; call authenticate() first")
-
-    def _sleep(self) -> None:
-        if self.rate_limit_sleep > 0:
-            time.sleep(self.rate_limit_sleep)
 
     def fetch_player_slugs(self, max_pages: int = 10) -> List[str]:
         """Scrape player slugs from players list page(s).
 
-        Returns list of URL slugs for individual player profiles.
+        Returns list of URL slugs for individual player profiles
+        # of pages scraped bounded by config.max_pages
         """
         self._ensure_authenticated()
         slugs: List[str] = []
-
-        for page in range(1, max_pages + 1):
-            url = f"{self.PLAYERS_LIST_URL}page/{page}/" if page > 1 else self.PLAYERS_LIST_URL
+        for page in range(1, self.config.max_pages + 1):
+            url = (
+                f"{self.PLAYERS_LIST_URL}page/{page}/"
+                if page > 1
+                else self.PLAYERS_LIST_URL
+            )
             logger.info("Fetching player list page %d", page)
-            try:
+
+            def _get():
                 resp = self.session.get(url, timeout=30)
                 if resp.status_code != 200:
-                    logger.warning("Page %d returned HTTP %d", page, resp.status_code)
-                    break
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # find player links (adjust selector based on actual HTML)
-                links = soup.select("a[href*='/player-profiles/']")
-                if not links:
-                    break
-                for link in links:
-                    href = link.get("href", "")
-                    if "/player-profiles/" in href:
-                        slug = href.rstrip("/").split("/")[-1]
-                        if slug and slug not in slugs:
-                            slugs.append(slug)
-                self._sleep()
-            except Exception as exc:
-                logger.error("Error fetching player list page %d: %s", page, exc)
-                break
+                    raise RuntimeError(f"HTTP {resp.status_code} on page {page}")
+                return resp.text
 
+            try:
+                html = self._retry_with_backoff(_get)
+            except Exception as exc:
+                logger.warning(
+                    "Stopping pagination after page %d due to error: %s", page, exc
+                )
+                break
+            soup = BeautifulSoup(html, "html.parser")
+            links = soup.select("a[href*='/player-profiles/']")
+            if not links:
+                break
+            for link in links:
+                href = link.get("href", "")
+                if "/player-profiles/" in href:
+                    slug = href.rstrip("/").split("/")[-1]
+                    if slug and slug not in slugs:
+                        slugs.append(slug)
+            self._sleep()
         logger.info("Found %d player slugs", len(slugs))
         return slugs
 
@@ -191,113 +197,69 @@ class BballIndexScraper:
     def fetch_player_profile(self, player_slug: str) -> Dict[str, Optional[str]]:
         """Fetch a single player profile by slug.
 
-        Returns dict of scraped stats
+        Returns dict of scraped k/v stats
+
+        Keys normed by lower‑casing and replacing spaces w/ "_"
+            If the profile unfetchable or unparssable
+            , then empty dict return
         struct of the return value should be tailored to actual HTML struct
          of bball-index’s player profile pages.
         """
         self._ensure_authenticated()
         url = f"{self.PROFILE_BASE_URL}{player_slug}/"
-        logger.info("Fetching Bball Index profile for %s", player_slug)
-        resp = self.session.get(url)
-        if resp.status_code != 200:
-            logger.error("Failed to fetch profile %s: HTTP %d", player_slug, resp.status_code)
+        logger.debug("Fetching profile: %s", player_slug)
+
+        def _get():
+            resp = self.session.get(url, timeout=30)
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code} for profile {player_slug}")
+            return resp.text
+        try:
+            html = self._retry_with_backoff(_get)
+        except Exception as exc:
+            logger.error("Failed to fetch profile %s: %s", player_slug, exc)
             return {}
-        soup = BeautifulSoup(resp.text, "html.parser")
-        #TODO: parse the HTML to extract stats.  Example below is a placeholder.
-        profile_data = {}
-        #Example: extract player name
+        soup = BeautifulSoup(html, "html.parser")
+        profile: Dict[str, Any] = {"slug": player_slug}
         header = soup.find("h1", class_="entry-title")
-        profile_data["name"] = header.get_text(strip=True) if header else None
-        # Add more parsing logic here
-        return profile_data
+        profile["name"] = header.get_text(strip=True) if header else None
+        tables = soup.find_all("table")
+        for table in tables[:3]:
+            rows = table.find_all("tr")
+            for row in rows:
+                cells = row.find_all(["th", "td"])
+                if len(cells) >= 2:
+                    key = (cells[0].get_text(strip=True)
+                        .lower().replace(" ", "_"))
+                    val = cells[1].get_text(strip=True)
+                    if key:
+                        profile[key] = val
+        return profile
 
     def fetch_all_profiles(self) -> pd.DataFrame:
-        """Iterate over a list of players and return a DataFrame of profiles.
+        """Iterate over a list of players and return a df of profiles.
 
         For demonstration, this method returns an empty DataFrame.  In
         production, you might first scrape a list of player slugs from
         the site or another data source, then call `fetch_player_profile`
         for each slug and aggregate the results into a DataFrame.
         """
-        logger.info("Fetching all player profiles (placeholder)")
-        return pd.DataFrame()
+        self._ensure_authenticated()
+        if player_slugs is None:
+            player_slugs = self.fetch_player_slugs()
+        player_slugs = player_slugs[: self.config.max_profiles]
+        logger.info("Fetching %d player profiles", len(player_slugs))
+        profiles: List[Dict[str, Any]] = []
+        for idx, slug in enumerate(player_slugs):
+            profile = self.fetch_player_profile(slug)
+            if profile:
+                profiles.append(profile)
+            if idx % 50 == 0 and idx > 0:
+                logger.info(
+                    "Progress: %d/%d profiles", idx, len(player_slugs)
+                )
+            self._sleep()
+        logger.info("Fetched %d profiles total", len(profiles))
+        return pd.DataFrame(profiles)
 
 
-
-    _____
-
-    class BballIndexScraper:
-        """Authenticate with bball-index.com and fetch player profiles."""
-
-        def fetch_player_profile(self, player_slug: str) -> Dict[str, Any]:
-            """Fetch single player profile by slug.
-
-            Returns dict with scraped data; empty dict on failure.
-            """
-            self._ensure_authenticated()
-            url = f"{self.PROFILE_BASE_URL}{player_slug}/"
-            logger.debug("Fetching profile: %s", player_slug)
-
-            try:
-                resp = self.session.get(url, timeout=30)
-                if resp.status_code != 200:
-                    logger.warning("Profile %s returned HTTP %d", player_slug, resp.status_code)
-                    return {}
-            except Exception as exc:
-                logger.error("Error fetching profile %s: %s", player_slug, exc)
-                return {}
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            profile: Dict[str, Any] = {"slug": player_slug}
-
-            # extract player name
-            header = soup.find("h1", class_="entry-title")
-            profile["name"] = header.get_text(strip=True) if header else None
-
-            # extract stats tables (adjust selectors based on actual HTML)
-            tables = soup.find_all("table")
-            for i, table in enumerate(tables[:3]):  # limit to first 3 tables
-                rows = table.find_all("tr")
-                for row in rows:
-                    cells = row.find_all(["th", "td"])
-                    if len(cells) >= 2:
-                        key = cells[0].get_text(strip=True).lower().replace(" ", "_")
-                        val = cells[1].get_text(strip=True)
-                        if key:
-                            profile[f"{key}"] = val
-
-            return profile
-
-        def fetch_all_profiles(
-                self,
-                player_slugs: Optional[List[str]] = None,
-                max_players: int = 500,
-        ) -> pd.DataFrame:
-            """Fetch profiles for all players (or provided list).
-
-            Args:
-                player_slugs: if None, scrapes player list first
-                max_players: limit to avoid runaway scraping
-
-            Returns:
-                DataFrame with player profile data
-            """
-            self._ensure_authenticated()
-
-            if player_slugs is None:
-                player_slugs = self.fetch_player_slugs()
-
-            player_slugs = player_slugs[:max_players]
-            logger.info("Fetching %d player profiles", len(player_slugs))
-
-            profiles: List[Dict[str, Any]] = []
-            for idx, slug in enumerate(player_slugs):
-                profile = self.fetch_player_profile(slug)
-                if profile:
-                    profiles.append(profile)
-                if idx % 50 == 0 and idx > 0:
-                    logger.info("Progress: %d/%d profiles", idx, len(player_slugs))
-                self._sleep()
-
-            logger.info("Fetched %d profiles total", len(profiles))
-            return pd.DataFrame(profiles)
