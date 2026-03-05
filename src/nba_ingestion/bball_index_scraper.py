@@ -35,7 +35,7 @@ class BballIndexConfig:
     retry_attempts(int): # of retries for each failed network request
         before giving up. Retries use exponential backoff with jitter.
 
-    backoff_base(flt): Base for exp backoff when retries occur, delay on the *n*‑th retry is roughly ``backoff_base ** n``
+    backoff_base(flt): Base for exp backoff when retries occur, delay on the *n*‑th retry is roughly "backoff_base ** n"
         sec plus jitter.
     backoff_max(flt): max sec of backoff delay and prevents
         backoff from growing boundlessly
@@ -88,6 +88,47 @@ class BballIndexScraper:
             )
         self.config = config or BballIndexConfig()
         self.session: Optional[requests.Session] = None
+
+    def _sleep(self) -> None:
+        #Sleep for the configured rate limit interval plus jitter
+        delay = self.config.rate_limit_sleep
+        if delay > 0:
+            jitter = delay * 0.1
+            time.sleep(delay + random.uniform(-jitter, jitter))
+
+    def _retry_with_backoff(self, func, *args, **kwargs):
+        """Execute "func" w/ retry and exp backoff.
+
+        Retries network‑related exceptions up to "retry_attempts" times.
+
+        Backoff delays grow exponentially according to "backoff_base"
+        with random jitter up to "jitter_factor" seconds, but are
+        capped by "backoff_max".  Any exception raised on the final
+        attempt is propagated.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(self.config.retry_attempts):
+            try:
+                return func(*args, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt == self.config.retry_attempts - 1:
+                    logger.error("Max retries reached: %s", exc)
+                    raise
+                delay = min(
+                    self.config.backoff_base ** attempt + random.uniform(0, self.config.jitter_factor),
+                    self.config.backoff_max,
+                )
+                logger.warning("Attempt %d/%d failed: %s. Retrying in %.1fs", attempt+1,
+                               self.config.retry_attempts, exc, delay,)
+                time.sleep(delay)
+        if last_exc:
+            raise last_exc
+
+    def _ensure_authenticated(self) -> None:
+        if self.session is None:
+            raise RuntimeError("Not authenticated; call authenticate() first")
+
 
     def authenticate(self) -> None:
         """Login to bball-index; assigns session on success."""
