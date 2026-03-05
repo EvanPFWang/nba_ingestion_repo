@@ -1,0 +1,30 @@
+{
+  "family": "nba-data-updater",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "${EXECUTION_ROLE_ARN}",
+  "taskRoleArn": "${TASK_ROLE_ARN}",
+  "containerDefinitions": [
+    {
+      "name": "${ECS_CONTAINER_NAME}",
+      "image": "${IMAGE_URI}",
+      "essential": true,
+      "environment": [
+        { "name": "BRONZE_BUCKET", "value": "${BRONZE_BUCKET}" },
+        { "name": "BRONZE_PREFIX", "value": "${BRONZE_PREFIX}" },
+        { "name": "AWS_REGION", "value": "${AWS_REGION}" },
+        { "name": "DRY_RUN", "value": "false" }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/nba-data-updater",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}

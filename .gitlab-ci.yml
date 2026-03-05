@@ -1,0 +1,216 @@
+stages:
+  - test
+  - build
+  - deploy
+
+## ------------------------------------------------------------------
+## Shared AWS OIDC authentication
+##
+## These anchors define job templates that assume an IAM role via
+## GitLab's OpenID Connect integration.  All AWS API calls in the
+## pipeline use temporary credentials obtained from the specified
+## `ROLE_ARN`.  See the README for variable descriptions.
+## ------------------------------------------------------------------
+
+.aws_oidc: &aws_oidc
+  image: alpine:3.20
+  tags:
+    - aws-docker
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      #change only if AWS IAM OIDC provider expects a different audience.
+      aud: sts.amazonaws.com
+  before_script:
+    - apk add --no-cache python3 py3-pip jq
+    - python3 -m pip install --no-cache-dir awscli
+    #assume IAM role using GitLab OIDC token
+    # role ARN must be provided via ROLE_ARN CI/CD variable
+    #temporary  credentials are exported into env var for AWS CLI
+    - >
+      aws_sts_output=$(aws sts assume-role-with-web-identity
+      --role-arn "${ROLE_ARN}"
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token "${GITLAB_OIDC_TOKEN}"
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text)
+    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    - aws sts get-caller-identity >/dev/null
+
+.docker_aws_oidc: &docker_aws_oidc
+  image: docker:24-cli
+  services:
+    - docker:24-dind
+  tags:
+    - aws-docker
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: sts.amazonaws.com
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache python3 py3-pip jq
+    - python3 -m pip install --no-cache-dir awscli
+    - >
+      aws_sts_output=$(aws sts assume-role-with-web-identity
+      --role-arn "${ROLE_ARN}"
+      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+      --web-identity-token "${GITLAB_OIDC_TOKEN}"
+      --duration-seconds 3600
+      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+      --output text)
+    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+    - aws sts get-caller-identity >/dev/null
+
+## ------------------------------------------------------------------
+## Test Stage
+##
+## Run Python unit tests (if any) to validate that the data updater
+## compiles and basic functions work.  The tests are optional; if no
+## `tests/` directory exists, pytest is skipped.
+## ------------------------------------------------------------------
+
+unit_tests:
+  stage: test
+  image: python:3.11-slim
+  tags:
+    - aws-docker
+  before_script:
+    - python -m pip install --upgrade pip
+    - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+    - pip install pytest
+  script:
+    - python -m compileall .
+    - if [ -d tests ]; then pytest -q; else echo "No tests/ directory; skipping pytest"; fi
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH'
+
+## ------------------------------------------------------------------
+## Build Stage
+##
+## Build a container image for the data updater and push it to ECR.
+## Each image is tagged with the Git commit SHA ($CI_COMMIT_SHA) to
+## ensure immutability.  A secondary `latest` tag can optionally be
+## applied for development convenience, but it should never be used in
+## production deployments.
+## ------------------------------------------------------------------
+
+build_and_push:
+  stage: build
+  extends: *docker_aws_oidc
+  needs:
+    - unit_tests
+  script:
+    - export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - export IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${CI_COMMIT_SHA}"
+    # Ensure the repository exists
+    - >
+      aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1
+      || aws ecr create-repository --repository-name "${ECR_REPOSITORY}" >/dev/null
+    # Authenticate Docker to ECR
+    - aws ecr get-login-password --region "${AWS_DEFAULT_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+    # Build and push the image with the commit SHA tag.  Avoid using :latest in production.
+    - docker build --pull -t "${IMAGE_URI}" .
+    - docker push "${IMAGE_URI}"
+    # Optionally push a mutable 'latest' tag for dev/testing (not used for deploy)
+    - docker tag "${IMAGE_URI}" "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+    - docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+    # Persist the image URI for downstream jobs
+    - printf "IMAGE_URI=%s\n" "${IMAGE_URI}" > build.env
+  artifacts:
+    reports:
+      dotenv: build.env
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+
+## ------------------------------------------------------------------
+## Deploy Stage – ECS
+##
+## When DEPLOY_TARGET=ecs, patch the ECS task definition with the
+## immutable image tag and update the service.  The deployment waits
+## until the service becomes stable before exiting.
+## ------------------------------------------------------------------
+
+deploy_ecs:
+  stage: deploy
+  extends: *aws_oidc
+  needs:
+    - build_and_push
+  environment:
+    name: production
+  script:
+    - export CURRENT_TASK_DEF_ARN="$(aws ecs describe-services --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}" --query 'services[0].taskDefinition' --output text)"
+    - aws ecs describe-task-definition --task-definition "${CURRENT_TASK_DEF_ARN}" --query 'taskDefinition' > task-def.json
+    # Patch the container image in the task definition JSON
+    - >
+      jq --arg IMAGE_URI "${IMAGE_URI}" --arg CONTAINER_NAME "${ECS_CONTAINER_NAME}"
+      '.containerDefinitions |= map(if .name == $CONTAINER_NAME then .image = $IMAGE_URI else . end)
+      | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)'
+      task-def.json > task-def-patched.json
+    - export NEW_TASK_DEF_ARN="$(aws ecs register-task-definition --cli-input-json file://task-def-patched.json --query 'taskDefinition.taskDefinitionArn' --output text)"
+    - aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --task-definition "${NEW_TASK_DEF_ARN}"
+    - aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOY_TARGET == "ecs"'
+
+## ------------------------------------------------------------------
+## Deploy Stage – EC2
+##
+## When DEPLOY_TARGET=ec2, execute an SSM Run Command on the target EC2
+## instance to pull the new container image and restart the service
+## defined in docker-compose.yml.  Using SSM avoids the need for SSH
+## access and provides execution logs within CloudWatch.
+## ------------------------------------------------------------------
+
+deploy_ec2:
+  stage: deploy
+  extends: *aws_oidc
+  needs:
+    - build_and_push
+  environment:
+    name: production
+  script:
+    - export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+    - |
+      cat > ssm-params.json <<EOF
+      {
+        "commands": [
+          "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}",
+          "docker pull ${IMAGE_URI}",
+          "mkdir -p ${EC2_APP_DIR}",
+          "cd ${EC2_APP_DIR}",
+          "IMAGE_URI=${IMAGE_URI} docker compose up -d --no-deps updater",
+          "docker image prune -f"
+        ]
+      }
+EOF
+    - export COMMAND_ID="$(aws ssm send-command --instance-ids "${EC2_INSTANCE_ID}" --document-name "AWS-RunShellScript" --comment "Deploy ${CI_PROJECT_PATH} ${CI_COMMIT_SHORT_SHA}" --parameters file://ssm-params.json --cloud-watch-output-config "CloudWatchOutputEnabled=true" --query 'Command.CommandId' --output text)"
+    - aws ssm wait command-executed --command-id "${COMMAND_ID}" --instance-id "${EC2_INSTANCE_ID}"
+    - aws ssm get-command-invocation --command-id "${COMMAND_ID}" --instance-id "${EC2_INSTANCE_ID}" --query '{Status:Status,StdOut:StandardOutputContent,StdErr:StandardErrorContent}' --output json
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOY_TARGET == "ec2"'
+
+## ------------------------------------------------------------------
+## Deploy Infrastructure
+##
+## When changes occur under the infra/ directory, run a separate job to
+## deploy or update the CloudFormation stack.  This job uses the AWS
+## SAM CLI to build and deploy the template.  It is deliberately
+## separated from application deployment to keep data plane and control
+## plane changes isolated.
+## ------------------------------------------------------------------
+
+deploy_infra:
+  stage: deploy
+  extends: *aws_oidc
+  script:
+    - apk add --no-cache python3 py3-pip
+    - pip3 install aws-sam-cli
+    - sam build --template-file infra/template.yaml
+    - sam deploy --stack-name nba-data-lake --resolve-s3 --capabilities CAPABILITY_NAMED_IAM --no-confirm-changeset
+  rules:
+    - changes:
+        - infra/**

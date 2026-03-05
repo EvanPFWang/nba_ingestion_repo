@@ -1,0 +1,11 @@
+# flip DRY_RUN to false once starts cleanly
+services:
+  updater:
+    image: ${IMAGE_URI:-nba-data-updater:latest}
+    container_name: nba_data_updater
+    environment:
+      BRONZE_BUCKET: ${BRONZE_BUCKET}
+      BRONZE_PREFIX: ${BRONZE_PREFIX:-bronze/nba}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      DRY_RUN: ${DRY_RUN:-false}
+    restart: "no"

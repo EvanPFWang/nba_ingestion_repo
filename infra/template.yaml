@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Example SAM/CloudFormation template for the NBA Data Lakehouse.  This
+  template provisions S3 buckets, IAM roles, a Glue database, a
+  Step Functions state machine and an EventBridge Scheduler rule for
+  orchestrating the DataUpdater ingestion.
+
+Parameters:
+  BronzeBucketName:
+    Type: String
+    Description: Name of the S3 bucket for raw (Bronze) data
+  SilverBucketName:
+    Type: String
+    Description: Name of the S3 bucket for Silver data (Iceberg)
+  GoldBucketName:
+    Type: String
+    Description: Name of the S3 bucket for Gold data (BI-ready)
+  DataUpdaterImage:
+    Type: String
+    Description: >-
+      URI of the Docker image for the DataUpdater (e.g.,
+      123456789012.dkr.ecr.us-east-1.amazonaws.com/nba-updater:abcdef0)
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: ID of the VPC where the ECS task will run
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the Fargate task (private subnets recommended)
+
+Resources:
+  ### S3 Buckets ###
+  BronzeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BronzeBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  SilverBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref SilverBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  GoldBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref GoldBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ### Glue Database and Example Iceberg Table ###
+  NbaDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: nba
+        Description: Database for NBA Silver and Gold tables
+  BoxScoresTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref NbaDatabase
+      TableInput:
+        Name: box_scores
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: iceberg
+          format: parquet
+          write.target.file.size.bytes: '536870912'
+        StorageDescriptor:
+          Columns:
+            - Name: game_id
+              Type: string
+            - Name: player_id
+              Type: string
+            - Name: points
+              Type: int
+            # Add additional columns as needed
+          Location: !Sub 's3://${SilverBucketName}/silver/nba/box_scores/'
+          InputFormat: org.apache.iceberg.mr.hive.HiveIcebergInputFormat
+          OutputFormat: org.apache.iceberg.mr.hive.HiveIcebergOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.iceberg.mr.hive.HiveIcebergSerDe
+            Parameters: {}
+      PartitionKeys:
+        - Name: season
+          Type: string
+
+  ### IAM Role for ECS Task ###
+  DataUpdaterTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: DataUpdaterS3Policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BronzeBucketName}'
+                  - !Sub 'arn:aws:s3:::${BronzeBucketName}/*'
+      # Additional permissions may be required for Glue catalog, CloudWatch logs, etc.
+
+  DataUpdaterTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ### ECS Task Definition ###
+  DataUpdaterTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: nba-data-updater
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt DataUpdaterTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt DataUpdaterTaskRole.Arn
+      ContainerDefinitions:
+        - Name: updater
+          Image: !Ref DataUpdaterImage
+          Essential: true
+          Environment:
+            - Name: BRONZE_BUCKET
+              Value: !Ref BronzeBucketName
+            - Name: BRONZE_PREFIX
+              Value: bronze/nba
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DRY_RUN
+              Value: 'false'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/nba-data-updater
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  ### ECS Service ###
+  DataUpdaterService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref DataUpdaterCluster
+      DesiredCount: 1
+      LaunchType: FARGATE
+      TaskDefinition: !Ref DataUpdaterTask
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets: !Ref SubnetIds
+          AssignPublicIp: ENABLED
+      SchedulingStrategy: REPLICA
+
+  ### ECS Cluster ###
+  DataUpdaterCluster:
+    Type: AWS::ECS::Cluster
+
+  ### EventBridge Scheduler Rule ###
+  DataUpdaterSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: nba-data-updater-schedule
+      ScheduleExpression: cron(0 7 * * ? *)  # Daily at 07:00 UTC; adjust as needed
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 30
+      Target:
+        Arn: !GetAtt DataUpdaterService.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+        Input: '{}'
+
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeEcs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ecs:RunTask
+                Resource: '*'
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !Ref DataUpdaterCluster
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
+
+  ### Step Functions State Machine (Simplified) ###
+  IngestionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: |
+        {
+          "Comment": "Orchestrate NBA ingestion and transformations",
+          "StartAt": "TriggerDataUpdater",
+          "States": {
+            "TriggerDataUpdater": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "LaunchType": "FARGATE",
+                "Cluster": "${DataUpdaterCluster}",
+                "TaskDefinition": "${DataUpdaterTask}",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ${SubnetIds},
+                    "AssignPublicIp": "ENABLED"
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "updater",
+                      "Environment": [
+                        { "Name": "DRY_RUN", "Value": "false" }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Next": "Success"
+            },
+            "Success": { "Type": "Succeed" }
+          }
+        }
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeEcsFromStepFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:DescribeTasks
+                Resource: '*'
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: '*'
