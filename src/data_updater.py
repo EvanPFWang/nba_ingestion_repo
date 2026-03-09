@@ -70,14 +70,26 @@ class DataUpdater:
         pbp_client: Instance of PBPStatsClient for fetching possession stats.
         bball_scraper: Optional instance of BballIndexScraper for player profiles.
     """
+    SOURCE_NBA_API = "nba_api"
+    SOURCE_PBPSTATS = "pbpstats"
+    SOURCE_BBALL_INDEX = "bball_index"
 
-    def __init__(self, season: str | None = None) -> None:
-        #load configuration and initialise S3 client
+    def __init__(self) -> None:
         self.settings: Settings = load_settings()
-        self.s3_client = boto3.client("s3", region_name=self.settings.aws_region)
+        self.s3 = boto3.client("s3", region_name=self.settings.aws_region)
 
-        #create client instances
-        self.nba_client = NBAApiClient(season=season or "2025-26")
+        #init state manager
+        self.state_manager = StateManager(
+            bucket=self.settings.bronze_bucket,
+            prefix=f"{self.settings.bronze_prefix}/state",
+            region=self.settings.aws_region,
+            local_path=self.settings.state_local_path or None,
+        )
+
+        #init clients
+        self.nba_client = NBAApiClient(
+            rate_limit_sleep=self.settings.nba_api_rate_limit_sleep,
+        )
         self.pbp_client = PBPStatsClient(
             rate_limit_sleep=self.settings.pbp_rate_limit_sleep,
             data_provider=self.settings.pbp_stats_provider,
@@ -85,23 +97,21 @@ class DataUpdater:
             data_dir=self.settings.pbp_stats_data_directory or None,
         )
 
-        #conditionally create a scraper only if credentials are provided
+        #bball-index scraper (optional)
         if self.settings.bball_email and self.settings.bball_password:
-            self.bball_scraper: BballIndexScraper | None = BballIndexScraper(
+            self.bball_scraper: Optional[BballIndexScraper] = BballIndexScraper(
                 self.settings.bball_email,
                 self.settings.bball_password,
             )
         else:
             self.bball_scraper = None
-            if not (self.settings.bball_email and self.settings.bball_password):
-                logger.info(
-                    "BBALL_EMAIL/BBALL_PSWRD not set – skipping Bball-Index scraping"
-                )
+            logger.info("BBALL_EMAIL/BBALL_PSWRD not set; skipping bball-index")
 
         logger.info(
-            "Initialised DataUpdater for bucket %s with prefix %s",
+            "DataUpdater init: bucket=%s prefix=%s dry_run=%s",
             self.settings.bronze_bucket,
             self.settings.bronze_prefix,
+            self.settings.dry_run,
         )
 
     def run(self) -> None:

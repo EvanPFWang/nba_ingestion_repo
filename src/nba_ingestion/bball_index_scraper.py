@@ -50,8 +50,8 @@ class BballIndexConfig:
     """
 
     rate_limit_sleep: float = 1.0
-    retry_attempts: int = 3
-    backoff_base: float = 2.0
+    retry_attempts: int = 5
+    backoff_base: float = 1.83
     backoff_max: float = 60.0
     jitter_factor: float = 0.1
     max_pages: int = 10
@@ -82,10 +82,8 @@ class BballIndexScraper:
         self.email = email or os.environ.get("BBALL_EMAIL") or os.environ.get("BBALL_USER")
         self.password = password or os.environ.get("BBALL_PSWRD")
         if not self.email or not self.password:
-            raise ValueError(
-                "Email and password must be provided either as arguments or via "
-                "BBALL_EMAIL/BBALL_USER and BBALL_PSWRD environment variables"
-            )
+            raise ValueError("Email and password must be provided either as arguments or via "
+                "BBALL_EMAIL/BBALL_USER and BBALL_PSWRD environment variables")
         self.config = config or BballIndexConfig()
         self.session: Optional[requests.Session] = None
 
@@ -159,25 +157,17 @@ class BballIndexScraper:
         self._ensure_authenticated()
         slugs: List[str] = []
         for page in range(1, self.config.max_pages + 1):
-            url = (
-                f"{self.PLAYERS_LIST_URL}page/{page}/"
-                if page > 1
-                else self.PLAYERS_LIST_URL
-            )
+            url = (f"{self.PLAYERS_LIST_URL}page/{page}/"
+                if page > 1 else self.PLAYERS_LIST_URL)
             logger.info("Fetching player list page %d", page)
 
             def _get():
                 resp = self.session.get(url, timeout=30)
-                if resp.status_code != 200:
-                    raise RuntimeError(f"HTTP {resp.status_code} on page {page}")
+                if resp.status_code != 200: raise RuntimeError(f"HTTP {resp.status_code} on page {page}")
                 return resp.text
-
-            try:
-                html = self._retry_with_backoff(_get)
+            try:                html = self._retry_with_backoff(_get)
             except Exception as exc:
-                logger.warning(
-                    "Stopping pagination after page %d due to error: %s", page, exc
-                )
+                logger.warning("Stopping pagination after page %d due to error: %s", page, exc)
                 break
             soup = BeautifulSoup(html, "html.parser")
             links = soup.select("a[href*='/player-profiles/']")
@@ -211,11 +201,9 @@ class BballIndexScraper:
 
         def _get():
             resp = self.session.get(url, timeout=30)
-            if resp.status_code != 200:
-                raise RuntimeError(f"HTTP {resp.status_code} for profile {player_slug}")
+            if resp.status_code != 200: raise RuntimeError(f"HTTP {resp.status_code} for profile {player_slug}")
             return resp.text
-        try:
-            html = self._retry_with_backoff(_get)
+        try:            html = self._retry_with_backoff(_get)
         except Exception as exc:
             logger.error("Failed to fetch profile %s: %s", player_slug, exc)
             return {}
@@ -235,7 +223,6 @@ class BballIndexScraper:
                     if key:
                         profile[key] = val
         return profile
-
     def fetch_all_profiles(self) -> pd.DataFrame:
         """Iterate over a list of players and return a df of profiles.
 
@@ -249,17 +236,20 @@ class BballIndexScraper:
             player_slugs = self.fetch_player_slugs()
         player_slugs = player_slugs[: self.config.max_profiles]
         logger.info("Fetching %d player profiles", len(player_slugs))
-        profiles: List[Dict[str, Any]] = []
-        for idx, slug in enumerate(player_slugs):
-            profile = self.fetch_player_profile(slug)
-            if profile:
-                profiles.append(profile)
-            if idx % 50 == 0 and idx > 0:
-                logger.info(
-                    "Progress: %d/%d profiles", idx, len(player_slugs)
-                )
-            self._sleep()
-        logger.info("Fetched %d profiles total", len(profiles))
-        return pd.DataFrame(profiles)
+        #fetch_player_profile across slugs w/ numpy.vectorize
+        #minimise explicit Python loops
 
-
+            #Still invokes underlying func seq but reduces
+        #boilerplate iter logic + apply sleep after each call
+        #inside fetch itself.
+        if not player_slugs:
+            return pd.DataFrame()
+        slug_array = np.array(player_slugs)
+        #vectorize returns a function that applies fetch_player_profile
+        #elementwise and collects results; specify object dtype
+        vectorised_fetch = np.vectorize(self.fetch_player_profile, otypes=[object])
+        profiles_vec = vectorised_fetch(slug_array)
+        #filter out empty dicts returned for failed profiles
+        profiles_list = [p for p in profiles_vec if isinstance(p, dict) and p]
+        logger.info("Fetched %d profiles total", len(profiles_list))
+        return pd.DataFrame.from_records(profiles_list)
