@@ -43,9 +43,11 @@ class NetworkCapture:
     """Capture and filter network responses
 
     Usage with Playwright:
+    ```
         capture = NetworkCapture()
         page.on("response", capture.on_response)
         json_responses = capture.get_json_responses()
+    ```
     """
 
     responses: List[CapturedResponse] = field(default_factory=list)
