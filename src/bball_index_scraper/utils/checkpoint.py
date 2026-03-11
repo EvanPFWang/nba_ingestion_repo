@@ -59,25 +59,62 @@ class CheckpointManager:
     def _create_tables(self):
         """Create checkpoint tables."""
         cursor = self.conn.cursor()
+
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS crawl_progress (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                player_id TEXT NOT NULL,
-                player_slug TEXT,
-                player_name TEXT,
-                season TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                url TEXT,
-                extraction_source TEXT,
-                stat_count INTEGER DEFAULT 0,
-                error TEXT,
-                attempts INTEGER DEFAULT 0,
-                last_attempt TEXT,
-                completed_at TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(player_id, season)
-            )
-        """)
+                       CREATE TABLE IF NOT EXISTS crawl_progress
+                       (
+                           id
+                           INTEGER
+                           PRIMARY
+                           KEY
+                           AUTOINCREMENT,
+                           player_id
+                           TEXT
+                           NOT
+                           NULL,
+                           player_slug
+                           TEXT,
+                           player_name
+                           TEXT,
+                           season
+                           TEXT
+                           NOT
+                           NULL,
+                           status
+                           TEXT
+                           NOT
+                           NULL
+                           DEFAULT
+                           'pending',
+                           url
+                           TEXT,
+                           extraction_source
+                           TEXT,
+                           stat_count
+                           INTEGER
+                           DEFAULT
+                           0,
+                           error
+                           TEXT,
+                           attempts
+                           INTEGER
+                           DEFAULT
+                           0,
+                           last_attempt
+                           TEXT,
+                           completed_at
+                           TEXT,
+                           created_at
+                           TEXT
+                           DEFAULT
+                           CURRENT_TIMESTAMP,
+                           UNIQUE
+                       (
+                           player_id,
+                           season
+                       )
+                           )
+                       """)
 
         cursor.execute("""
                        CREATE INDEX IF NOT EXISTS idx_progress_status
