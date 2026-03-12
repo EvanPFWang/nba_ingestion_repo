@@ -1,6 +1,7 @@
-"""Uses pbpstats' documented Client/Game/Possessions flow
-to fetch possession-level data for a list of game IDs and flatten into
-a Pandas DataFrame.
+"""Client for pbpstats possession data.
+
+Uses pbpstats Client/Game/Possessions flow to fetch possession-level
+data. Implements rate limiting and handles API failures gracefully.
 """
 
 import logging
@@ -11,17 +12,17 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 
 try:
-    import pbpstats  # noqa: F401
+    import pbpstats  #noqa: F401
     from pbpstats.client import Client
 except ImportError:
-    pbpstats = None  # type: ignore
-    Client = None  # type: ignore
+    pbpstats = None  #type: ignore
+    Client = None  #type: ignore
 
 logger = logging.getLogger(__name__)
 
 
 class PBPStatsClient:
-    """Encapsulate pbpstats API calls."""
+    #Encapsulate pbpstats API calls
 
     def __init__(
         self,
@@ -48,6 +49,7 @@ class PBPStatsClient:
 
     @staticmethod
     def _safe_get(obj: Any, attr: str, default: Any = None) -> Any:
+        #Safely get attribute from object; return default on failure
         try:
             return getattr(obj, attr)
         except Exception:
@@ -55,6 +57,7 @@ class PBPStatsClient:
 
     @staticmethod
     def _normalize_game_ids(game_ids: List[str]) -> List[str]:
+        #Dedupe and clean game IDs
         seen = set()
         normalized: List[str] = []
         for game_id in game_ids:
@@ -67,10 +70,11 @@ class PBPStatsClient:
             normalized.append(gid)
         return normalized
 
-    def _flatten_possession(self, game_id: str, possession: Any, fallback_idx: int) -> Dict[str, Any]:
+    def _flatten_possession(self,game_id: str,possession: Any,
+        fallback_idx: int,) -> Dict[str, Any]:
+        #Extract flat dict from possession object
         events = self._safe_get(possession, "events", []) or []
-        first_event = events[0] if events else None
-        last_event = events[-1] if events else None
+        first_event,last_event = events[0] if events else None, events[-1] if events else None
 
         prev_event = self._safe_get(possession, "previous_possession_ending_event")
         prev_event_type = type(prev_event).__name__ if prev_event is not None else None
@@ -79,7 +83,7 @@ class PBPStatsClient:
         try:
             team_ids = possession.get_team_ids() or []
         except Exception:
-            team_ids = []
+            pass
 
         return {
             "game_id": str(game_id),
@@ -88,7 +92,7 @@ class PBPStatsClient:
             "start_time": self._safe_get(possession, "start_time"),
             "end_time": self._safe_get(possession, "end_time"),
             "offense_team_id": self._safe_get(possession, "offense_team_id"),
-            "team_ids": ",".join(str(team_id) for team_id in team_ids) if team_ids else None,
+            "team_ids": ",".join(str(tid) for tid in team_ids) if team_ids else None,
             "start_score_margin": self._safe_get(possession, "start_score_margin"),
             "possession_start_type": self._safe_get(possession, "possession_start_type"),
             "possession_has_timeout": self._safe_get(possession, "possession_has_timeout"),
@@ -111,29 +115,35 @@ class PBPStatsClient:
             "end_score": self._safe_get(last_event, "score"),
         }
 
-    def fetch_possession_stats(self, game_ids: List[str]) -> pd.DataFrame:
-        """Fetch possession-level rows for a list of game IDs.
+    def fetch_possession_stats(
+            self,
+            game_ids: List[str],
+            max_failures: int = 5,
+    ) -> pd.DataFrame:
+        """Fetch possession rows for game IDs with failure tolerance.
 
-        Returns one row per possession.
+        Args:
+            game_ids: list of game IDs to fetch
+            max_failures: consecutive failures before aborting batch
+
+        Returns:
+            DataFrame with one row per possession
         """
         if Client is None:
-            logger.warning("pbpstats not available – returning empty DataFrame")
+            logger.warning("pbpstats not available; returning empty DataFrame")
             return pd.DataFrame()
 
         game_ids = self._normalize_game_ids(game_ids)
         if not game_ids:
-            logger.info("No game IDs provided to pbpstats – returning empty DataFrame")
+            logger.info("No game IDs provided; returning empty DataFrame")
             return pd.DataFrame()
 
-        logger.info(
-            "Fetching possession stats for %d games using provider=%s source=%s",
-            len(game_ids),
-            self.data_provider,
-            self.source,
-        )
+        logger.info("Fetching possession stats for %d games [provider=%s source=%s]",
+            len(game_ids),self.data_provider,self.source,)
 
         client = Client(self._build_settings())
         rows: List[Dict[str, Any]] = []
+        consecutive_failures = 0
 
         for idx, game_id in enumerate(game_ids):
             try:
@@ -142,36 +152,40 @@ class PBPStatsClient:
                 possession_items = self._safe_get(possessions_resource, "items", []) or []
 
                 if not possession_items:
-                    logger.warning("No possession items returned for game %s", game_id)
+                    logger.warning("No possessions for game %s", game_id)
                     continue
 
                 for p_idx, possession in enumerate(possession_items):
                     rows.append(self._flatten_possession(game_id, possession, p_idx))
 
-            except Exception as exc:
-                logger.warning("Failed to fetch pbpstats possessions for game %s: %s", game_id, exc)
+                consecutive_failures = 0  # reset on success
 
+            except Exception as exc:
+                consecutive_failures += 1
+                logger.warning("Failed game %s (%d/%d): %s", game_id, consecutive_failures, max_failures, exc)
+                if consecutive_failures >= max_failures:
+                    logger.error("Aborting batch after %d consecutive failures", max_failures)
+                    break
+
+            #rate limiting
             if self.rate_limit_sleep > 0 and idx < len(game_ids) - 1:
                 time.sleep(self.rate_limit_sleep)
 
         df = pd.DataFrame(rows)
-
         if df.empty:
             logger.warning("pbpstats returned no possession rows")
             return df
 
-        numeric_columns = [
-            "possession_number",
-            "period",
-            "offense_team_id",
-            "start_score_margin",
+        #coerce numeric columns
+        numeric_cols = [
+            "possession_number", "period", "offense_team_id", "start_score_margin",
             "previous_possession_end_shooter_player_id",
             "previous_possession_end_rebound_player_id",
             "previous_possession_end_steal_player_id",
             "previous_possession_end_turnover_player_id",
             "event_count",
         ]
-        for col in numeric_columns:
+        for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
