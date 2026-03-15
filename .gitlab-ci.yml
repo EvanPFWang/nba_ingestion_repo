@@ -1,8 +1,13 @@
 stages:
   - test
   - build
-  - deploy
+  - deploy-infra    # Control plane FIRST
+  - deploy-app      # Data plane AFTER infra
 
+variables:
+  IMAGE_TAG: ${CI_COMMIT_SHA}  #Immutable tag for production deployments
+
+  AWS_SESSION_DURATION: "900"#Reduced session duration (15 min sufficient for most jobs)
 ## ------------------------------------------------------------------
 ## Shared AWS OIDC authentication
 ##
@@ -12,56 +17,116 @@ stages:
 ## `ROLE_ARN`.  See the README for variable descriptions.
 ## ------------------------------------------------------------------
 
-.aws_oidc: &aws_oidc
+.aws_oidc_base: &aws_oidc_base
   image: alpine:3.20
   tags:
     - aws-docker
   id_tokens:
     GITLAB_OIDC_TOKEN:
-      #change only if AWS IAM OIDC provider expects a different audience.
-      aud: sts.amazonaws.com
+      aud: sts.amazonaws.com  #change only if AWS IAM OIDC provider expects a different audience.
   before_script:
-    - apk add --no-cache python3 py3-pip jq
-    - python3 -m pip install --no-cache-dir awscli
-    #assume IAM role using GitLab OIDC token
-    # role ARN must be provided via ROLE_ARN CI/CD variable
-    #temporary  credentials are exported into env var for AWS CLI
-    - >
-      aws_sts_output=$(aws sts assume-role-with-web-identity
-      --role-arn "${ROLE_ARN}"
-      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
-      --web-identity-token "${GITLAB_OIDC_TOKEN}"
-      --duration-seconds 3600
-      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
-      --output text)
-    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
-    - aws sts get-caller-identity >/dev/null
 
-.docker_aws_oidc: &docker_aws_oidc
+.assume_role_script: &assume_role_script
+  - apk add --no-cache python3 py3-pip jq coreutils
+  - python3 -m pip install --no-cache-dir --quiet awscli
+  # Validate required variables before proceeding
+  - |
+    if [ -z "${ROLE_ARN}" ]; then
+      echo "ERROR: ROLE_ARN is not set" >&2
+      exit 1
+    fi
+  # Assume role with proper JSON parsing (avoids word-splitting vulnerability)
+  - |
+    aws_creds=$(aws sts assume-role-with-web-identity \
+      --role-arn "${ROLE_ARN}" \
+      --role-session-name "gitlab-${CI_PROJECT_ID}-${CI_PIPELINE_ID}-${CI_JOB_ID}" \
+      --web-identity-token "${GITLAB_OIDC_TOKEN}" \
+      --duration-seconds "${AWS_SESSION_DURATION}" \
+      --output json)
+
+    export AWS_ACCESS_KEY_ID=$(echo "$aws_creds" | jq -r '.Credentials.AccessKeyId')
+    export AWS_SECRET_ACCESS_KEY=$(echo "$aws_creds" | jq -r '.Credentials.SecretAccessKey')
+    export AWS_SESSION_TOKEN=$(echo "$aws_creds" | jq -r '.Credentials.SessionToken')
+
+    # Clear sensitive data from shell memory
+    unset aws_creds
+  # Verify credentials work
+  - aws sts get-caller-identity --output json | jq '{Account, Arn}'
+
+
+.aws_oidc:
+  <<: *aws_oidc_base
+  before_script:
+    - *assume_role_script
+
+.docker_aws_oidc:
+  <<: *aws_oidc_base
   image: docker:24-cli
   services:
     - docker:24-dind
-  tags:
-    - aws-docker
-  id_tokens:
-    GITLAB_OIDC_TOKEN:
-      aud: sts.amazonaws.com
   variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
+    # TLS ENABLED - fixes insecure channel vulnerability
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: /certs/client
+    DOCKER_TLS_CERTDIR: /certs
   before_script:
-    - apk add --no-cache python3 py3-pip jq
-    - python3 -m pip install --no-cache-dir awscli
-    - >
-      aws_sts_output=$(aws sts assume-role-with-web-identity
-      --role-arn "${ROLE_ARN}"
-      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
-      --web-identity-token "${GITLAB_OIDC_TOKEN}"
-      --duration-seconds 3600
-      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
-      --output text)
-    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
-    - aws sts get-caller-identity >/dev/null
+    - *assume_role_script
+
+    #assume IAM role using GitLab OIDC token
+    # role ARN must be provided via ROLE_ARN CI/CD variable
+    #temporary  credentials are exported into env var for AWS CLI
+#    - >
+#      aws_sts_output=$(aws sts assume-role-with-web-identity
+#      --role-arn "${ROLE_ARN}"
+#      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+#      --web-identity-token "${GITLAB_OIDC_TOKEN}"
+#      --duration-seconds 3600
+#      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+#      --output text)
+
+
+#
+
+
+#    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+#[Error]swallows output of verification cmd, checks if cmd works but never
+# tells which account dev in + risk of deploy to wrong environ
+#    - aws sts get-caller-identity >/dev/null
+
+#.docker_aws_oidc: &docker_aws_oidc
+#  image: docker:24-cli
+#  services:
+#    - docker:24-dind
+#  tags:
+#    - aws-docker
+#  id_tokens:
+#    GITLAB_OIDC_TOKEN:
+#      aud: sts.amazonaws.com
+#  variables:
+#[Error]sending docker build command over plain text wire, heavy exposure of creds
+#    DOCKER_HOST: tcp://docker:2375
+#    DOCKER_TLS_CERTDIR: ""
+#  before_script:
+#    - apk add --no-cache python3 py3-pip jq
+#    - python3 -m pip install --no-cache-dir awscli
+#    - >
+#      aws_sts_output=$(aws sts assume-role-with-web-identity
+#      --role-arn "${ROLE_ARN}"
+#[Error]omits ${CI_JOB_ID} bad for error auditing
+#      --role-session-name "GitLabRunner-${CI_PROJECT_ID}-${CI_PIPELINE_ID}"
+#      --web-identity-token "${GITLAB_OIDC_TOKEN}"
+#[Error]requests a WHOLE HOUR
+#      --duration-seconds 3600
+#[Error]forces text-based space-separated string - relies on CLI and shell agreemnt on space/lb handling
+#      --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]'
+#      --output text)
+#[Error]unquoted variable expansion in export command
+# since unquoted $aws_sts_output shell's word splitting opens vulnerability by manipulating environment output
+#with injection attacks + easy to fail from '*' and '?'
+#    - export $(printf "AWS_ACCESS_KEY_ID=%s AWS_SECRET_ACCESS_KEY=%s AWS_SESSION_TOKEN=%s" $aws_sts_output)
+#[Error]
+#    - aws sts get-caller-identity >/dev/null
 
 ## ------------------------------------------------------------------
 ## Test Stage
@@ -70,12 +135,13 @@ stages:
 ## compiles and basic functions work.  The tests are optional; if no
 ## `tests/` directory exists, pytest is skipped.
 ## ------------------------------------------------------------------
-
 unit_tests:
   stage: test
-  image: python:3.11-slim
+  #forgot to swap to 3.12
+  image: python:3.12-slim
   tags:
     - aws-docker
+  #shortens
   before_script:
     - python -m pip install --upgrade pip
     - if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
@@ -99,12 +165,15 @@ unit_tests:
 
 build_and_push:
   stage: build
-  extends: *docker_aws_oidc
+  extends: .docker_aws_oidc
   needs:
-    - unit_tests
+    - job: unit_tests
+      optional: false
+  variables:
+    AWS_SESSION_DURATION: "1800"  # Build may take longer
   script:
     - export ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
-    - export IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${CI_COMMIT_SHA}"
+    - export IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
     # Ensure the repository exists
     - >
       aws ecr describe-repositories --repository-names "${ECR_REPOSITORY}" >/dev/null 2>&1
