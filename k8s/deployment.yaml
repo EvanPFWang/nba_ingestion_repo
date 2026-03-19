@@ -1,0 +1,110 @@
+#kubernetes manifests for EKS deployment
+#substitute IMAGE_URI_PLACEHOLDER in CI pipeline
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nba-ingestion
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nba-updater-config
+  namespace: nba-ingestion
+data:
+  BRONZE_BUCKET: "nba-lake-bronze"
+  BRONZE_PREFIX: "bronze/nba"
+  AWS_REGION: "us-east-1"
+  DRY_RUN: "false"
+  INITIAL_START_DATE: "2015-10-01"
+  BATCH_DAYS: "30"
+  PBP_STATS_PROVIDER: "data_nba"
+  PBP_STATS_SOURCE: "web"
+  PBP_STATS_RATE_LIMIT_SLEEP: "0.5"
+  NBA_API_RATE_LIMIT_SLEEP: "0.6"
+---
+#secrets stored separately (create via kubectl or ExternalSecrets)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nba-updater-secrets
+  namespace: nba-ingestion
+type: Opaque
+stringData:
+  BBALL_EMAIL: ""  #set via kubectl create secret
+  BBALL_PSWRD: ""
+---
+#daily CronJob (07:00 UTC)
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: nba-data-updater
+  namespace: nba-ingestion
+spec:
+  schedule: "0 7 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        metadata:
+          labels:
+            app: nba-data-updater
+        spec:
+          serviceAccountName: nba-updater-sa
+          restartPolicy: OnFailure
+          containers:
+            - name: updater
+              image: IMAGE_URI_PLACEHOLDER
+              envFrom:
+                - configMapRef:
+                    name: nba-updater-config
+                - secretRef:
+                    name: nba-updater-secrets
+              resources:
+                requests:
+                  memory: "512Mi"
+                  cpu: "250m"
+                limits:
+                  memory: "1Gi"
+                  cpu: "500m"
+---
+#service account with IRSA for S3 access
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nba-updater-sa
+  namespace: nba-ingestion
+  annotations:
+    #set IAM role ARN for IRSA
+    eks.amazonaws.com/role-arn: ""
+---
+#optional: manual run Job template
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nba-data-updater-manual
+  namespace: nba-ingestion
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: nba-data-updater
+    spec:
+      serviceAccountName: nba-updater-sa
+      restartPolicy: Never
+      containers:
+        - name: updater
+          image: IMAGE_URI_PLACEHOLDER
+          envFrom:
+            - configMapRef:
+                name: nba-updater-config
+            - secretRef:
+                name: nba-updater-secrets
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
