@@ -250,9 +250,22 @@ deploy_ecs:
       '.containerDefinitions |= map(if .name == $CONTAINER_NAME then .image = $IMAGE_URI else . end)
       | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)'
       task-def.json > task-def-patched.json
-    - export NEW_TASK_DEF_ARN="$(aws ecs register-task-definition --cli-input-json file://task-def-patched.json --query 'taskDefinition.taskDefinitionArn' --output text)"
-    - aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --task-definition "${NEW_TASK_DEF_ARN}"
+      
+      #Register new revision
+    - |
+      NEW_TASK_DEF_ARN=$(aws ecs register-task-definition \
+        --cli-input-json file://task-def-patched.json \
+        --query 'taskDefinition.taskDefinitionArn' \
+        --output text)
+      echo "Registered new task definition: ${NEW_TASK_DEF_ARN}"
+      
+      #Update service with forced new deployment
+    - aws ecs update-service --cluster "${ECS_CLUSTER}" --service "${ECS_SERVICE}" --task-definition "${NEW_TASK_DEF_ARN}"         --force-new-deployment
+
+#Wait for deployment to stabilize
     - aws ecs wait services-stable --cluster "${ECS_CLUSTER}" --services "${ECS_SERVICE}"
+    - echo "Deployment complete. Service is stable."
+
   rules:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $DEPLOY_TARGET == "ecs"'
 
@@ -441,3 +454,30 @@ deploy_infra:
     - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
       changes:
         - infra/**
+
+##------------------------------------------------------------------
+##clean up job
+#(Manual trigger only)
+##
+cleanup_old_images:
+  stage: deploy-app
+  extends: .aws_oidc
+  when: manual
+  script:
+    - |
+      # Keep last 10 images, delete older ones
+      aws ecr describe-images \
+        --repository-name "${ECR_REPOSITORY}" \
+        --query 'imageDetails | sort_by(@, &imagePushedAt) | [:-10].[imageDigest]' \
+        --output text | \
+      while read digest; do
+        if [ -n "$digest" ]; then
+          echo "Deleting: $digest"
+          aws ecr batch-delete-image \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageDigest="$digest" || true
+        fi
+      done
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
