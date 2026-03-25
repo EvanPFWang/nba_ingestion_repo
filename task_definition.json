@@ -2,8 +2,8 @@
   "family": "nba-data-updater",
   "networkMode": "awsvpc",
   "requiresCompatibilities": ["FARGATE"],
-  "cpu": "256",
-  "memory": "512",
+  "cpu": "512",
+  "memory": "1024",
   "executionRoleArn": "${EXECUTION_ROLE_ARN}",
   "taskRoleArn": "${TASK_ROLE_ARN}",
   "containerDefinitions": [
@@ -14,15 +14,31 @@
       "environment": [
         { "name": "BRONZE_BUCKET", "value": "${BRONZE_BUCKET}" },
         { "name": "BRONZE_PREFIX", "value": "${BRONZE_PREFIX}" },
+        { "name": "SILVER_BUCKET", "value": "${SILVER_BUCKET}" },
+        { "name": "SILVER_PREFIX", "value": "${SILVER_PREFIX}" },
+        { "name": "GOLD_BUCKET", "value": "${GOLD_BUCKET}" },
+        { "name": "GOLD_PREFIX", "value": "${GOLD_PREFIX}" },
         { "name": "AWS_REGION", "value": "${AWS_REGION}" },
-        { "name": "DRY_RUN", "value": "false" }
+        { "name": "DRY_RUN", "value": "false" },
+        { "name": "INITIAL_START_DATE", "value": "${INITIAL_START_DATE}" },
+        { "name": "INITIAL_INGESTION_DATE", "value": "${INITIAL_INGESTION_DATE}" },
+        { "name": "BATCH_DAYS", "value": "${BATCH_DAYS}" },
+        { "name": "PBP_STATS_PROVIDER", "value": "data_nba" },
+        { "name": "PBP_STATS_SOURCE", "value": "web" },
+        { "name": "PBP_STATS_RATE_LIMIT_SLEEP", "value": "0.5" },
+        { "name": "NBA_API_RATE_LIMIT_SLEEP", "value": "0.6" }
+      ],
+      "secrets": [
+        { "name": "BBALL_EMAIL", "valueFrom": "${BBALL_CREDS_SECRET_ARN}:email::" },
+        { "name": "BBALL_PSWRD", "valueFrom": "${BBALL_CREDS_SECRET_ARN}:password::" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
         "options": {
           "awslogs-group": "/ecs/nba-data-updater",
           "awslogs-region": "${AWS_REGION}",
-          "awslogs-stream-prefix": "ecs"
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
         }
       }
     }
