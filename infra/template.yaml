@@ -1,32 +1,41 @@
 AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
 Description: >-
   Example SAM/CloudFormation template for the NBA Data Lakehouse.  This
   template provisions S3 buckets, IAM roles, a Glue database, a
-  Step Functions state machine and an EventBridge Scheduler rule for
+  Step Functions state machine, ECS cluster, and an EventBridge Scheduler rule for
   orchestrating the DataUpdater ingestion.
 
 Parameters:
   BronzeBucketName:
     Type: String
-    Description: Name of the S3 bucket for raw (Bronze) data
+    Description: S3 bucket for raw (Bronze) data
+    Default: nba-lake-bronze
   SilverBucketName:
     Type: String
-    Description: Name of the S3 bucket for Silver data (Iceberg)
+    Description: S3 bucket for Silver data (Iceberg)
+    Default: nba-lake-silver
   GoldBucketName:
     Type: String
-    Description: Name of the S3 bucket for Gold data (BI-ready)
+    Description: S3 bucket for Gold data (BI-ready)
+    Default: nba-lake-gold
   DataUpdaterImage:
     Type: String
-    Description: >-
-      URI of the Docker image for the DataUpdater (e.g.,
-      123456789012.dkr.ecr.us-east-1.amazonaws.com/nba-updater:abcdef0)
+    Description: ECR image URI for DataUpdater container
   VpcId:
     Type: AWS::EC2::VPC::Id
     Description: ID of the VPC where the ECS task will run
   SubnetIds:
     Type: List<AWS::EC2::Subnet::Id>
-    Description: Subnets for the Fargate task (private subnets recommended)
-
+    Description: Subnets for Fargate task (private subnets recommended)
+  InitialStartDate:
+    Type: String
+    Default: "2015-10-01"
+    Description: Start date for initial backfill
+  InitialIngestionDate:
+    Type: String
+    Default: ""
+    Description: End date for initial backfill (default=today)
 Resources:
   ### S3 Buckets ###
   BronzeBucket:
@@ -39,6 +48,14 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+
   SilverBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -49,6 +66,7 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+
   GoldBucket:
     Type: AWS::S3::Bucket
     Properties:
@@ -60,6 +78,14 @@ Resources:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
 
+  #secrets manager for bball-index creds
+  BballCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: nba-ingestion/bball-index
+      Description: Bball-Index login credentials
+      SecretString: '{"email":"","password":""}'
+
   ### Glue Database and Example Iceberg Table ###
   NbaDatabase:
     Type: AWS::Glue::Database
@@ -67,7 +93,9 @@ Resources:
       CatalogId: !Ref AWS::AccountId
       DatabaseInput:
         Name: nba
-        Description: Database for NBA Silver and Gold tables
+        Description: NBA Silver and Gold tables (Iceberg)
+
+
   BoxScoresTable:
     Type: AWS::Glue::Table
     Properties:
@@ -100,30 +128,47 @@ Resources:
           Type: string
 
   ### IAM Role for ECS Task ###
-  DataUpdaterTaskRole:
-    Type: AWS::IAM::Role
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
     Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: ecs-tasks.amazonaws.com
-            Action: sts:AssumeRole
-      Path: /
-      Policies:
-        - PolicyName: DataUpdaterS3Policy
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                  - s3:ListBucket
-                Resource:
-                  - !Sub 'arn:aws:s3:::${BronzeBucketName}'
-                  - !Sub 'arn:aws:s3:::${BronzeBucketName}/*'
+      Family: nba-data-updater
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: updater
+          Image: !Ref DataUpdaterImage
+          Essential: true
+          Environment:
+            - Name: BRONZE_BUCKET
+              Value: !Ref BronzeBucketName
+            - Name: BRONZE_PREFIX
+              Value: bronze/nba
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DRY_RUN
+              Value: 'false'
+            - Name: INITIAL_START_DATE
+              Value: !Ref InitialStartDate
+            - Name: INITIAL_INGESTION_DATE
+              Value: !Ref InitialIngestionDate
+            - Name: BATCH_DAYS
+              Value: '30'
+          Secrets:
+            - Name: BBALL_EMAIL
+              ValueFrom: !Sub '${BballCredentialsSecret}:email::'
+            - Name: BBALL_PSWRD
+              ValueFrom: !Sub '${BballCredentialsSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
       # Additional permissions may be required for Glue catalog, CloudWatch logs, etc.
 
   DataUpdaterTaskExecutionRole:
